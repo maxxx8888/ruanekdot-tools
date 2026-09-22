@@ -3,7 +3,7 @@
 (function () {
     'use strict';
 
-    const CSV_URL = '/000.csv';
+    const CSV_URL = 'https://cdn.jsdelivr.net/gh/maxxx8888/ruanekdot-tools/000.csv';
     const CACHE_KEY = 'tags_db_v1';
     const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 часов
 
