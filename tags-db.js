@@ -1,164 +1,138 @@
-// tags-db.js — v1
-// Загружает 000.csv, строит индекс, даёт поиск и автодополнение
+// tags-db.js — v2
+// Загружает 000.csv (14 МБ) ОДИН РАЗ, конвертирует в массив тегов,
+// кэширует в IndexedDB (не в localStorage — там лимит 5 МБ).
+// При повторных заходах — мгновенно из кэша.
+
 (function () {
     'use strict';
 
-    const CSV_URL = 'https://cdn.jsdelivr.net/gh/maxxx8888/ruanekdot-tools/000.csv';
-    const CACHE_KEY = 'tags_db_v1';
-    const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 часов
+    const CSV_URL = 'https://cdn.jsdelivr.net/gh/maxxx8888/ruanekdot-tools@main/000.csv';
+    const DB_NAME = 'ruanekdot';
+    const STORE = 'tags';
+    const CACHE_KEY = 'v2';
+    const CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 дней
 
-    let DB = null;         // массив нормализованных тегов
-    let INDEX = null;      // { byName: Map, byPrefix: Map }
+    let _db = null;
+    let _loading = null;
 
-    // ─── CSV-парсер (учитывает кавычки и запятые внутри кавычек) ───
-    function parseCSV(text) {
-        const rows = [];
-        let row = [], field = '', inQ = false;
-        for (let i = 0; i < text.length; i++) {
-            const ch = text[i], nx = text[i + 1];
-            if (inQ) {
-                if (ch === '"' && nx === '"') { field += '"'; i++; }
-                else if (ch === '"') inQ = false;
-                else field += ch;
-            } else {
-                if (ch === '"') inQ = true;
-                else if (ch === ',') { row.push(field); field = ''; }
-                else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
-                else if (ch !== '\r') field += ch;
+    // ═══ IndexedDB helpers ═══
+    function openDb() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(DB_NAME, 1);
+            req.onupgradeneeded = () => {
+                req.result.createObjectStore(STORE);
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function idbGet(key) {
+        const db = await openDb();
+        return new Promise((resolve) => {
+            const tx = db.transaction(STORE, 'readonly');
+            const req = tx.objectStore(STORE).get(key);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+        });
+    }
+
+    async function idbSet(key, val) {
+        const db = await openDb();
+        return new Promise((resolve) => {
+            const tx = db.transaction(STORE, 'readwrite');
+            const req = tx.objectStore(STORE).put(val, key);
+            req.onsuccess = () => resolve();
+            req.onerror = () => resolve();
+        });
+    }
+
+    // ═══ Парсер CSV ═══
+    function parseCsv(text) {
+        const tags = new Set();
+        const lines = text.split(/\r?\n/);
+        for (const line of lines) {
+            if (!line) continue;
+            // простая логика: разбиваем по запятым, но учитываем кавычки
+            const parts = [];
+            let cur = '';
+            let inQuote = false;
+            for (let i = 0; i < line.length; i++) {
+                const ch = line[i];
+                if (ch === '"') { inQuote = !inQuote; continue; }
+                if (ch === ',' && !inQuote) { parts.push(cur); cur = ''; continue; }
+                cur += ch;
+            }
+            parts.push(cur);
+
+            for (let p of parts) {
+                p = p.toLowerCase().trim().replace(/^["'«»]+|["'«»]+$/g, '');
+                if (!p) continue;
+                if (p.length < 3 || p.length > 40) continue;
+                if (!/[а-яa-z]/.test(p)) continue;
+                if (/^\d+$/.test(p)) continue;
+                tags.add(p);
             }
         }
-        if (field || row.length) { row.push(field); rows.push(row); }
-        return rows;
+        return Array.from(tags);
     }
 
-    // ─── Нормализация тега ───
-    function norm(t) {
-        return String(t || '')
-            .trim()
-            .toLowerCase()
-            .replace(/ё/g, 'е')
-            .replace(/[«»"']/g, '')
-            .replace(/\s+/g, ' ')
-            .replace(/^[,;.\-\s]+|[,;.\-\s]+$/g, '');
-    }
-
-    // ─── Строим индекс ───
-    function buildIndex(tags) {
-        const byName = new Map();
-        const byPrefix = new Map();
-        for (const t of tags) {
-            byName.set(t.name, t);
-            // все префиксы длиной 2..6 для быстрого поиска
-            const maxLen = Math.min(t.name.length, 6);
-            for (let L = 2; L <= maxLen; L++) {
-                const p = t.name.substring(0, L);
-                if (!byPrefix.has(p)) byPrefix.set(p, []);
-                byPrefix.get(p).push(t);
-            }
-        }
-        return { byName, byPrefix };
-    }
-
-    // ─── Загрузка ───
+    // ═══ Загрузка ═══
     async function load() {
-        if (DB) return DB;
+        if (_db) return _db;
+        if (_loading) return _loading;
 
-        // кэш
-        try {
-            const raw = localStorage.getItem(CACHE_KEY);
-            if (raw) {
-                const c = JSON.parse(raw);
-                if (c.ts && Date.now() - c.ts < CACHE_TTL) {
-                    DB = c.tags;
-                    INDEX = buildIndex(DB);
-                    console.log('📚 Теги из кэша:', DB.length);
-                    return DB;
+        _loading = (async () => {
+            // 1. Пробуем кэш
+            try {
+                const cached = await idbGet(CACHE_KEY);
+                if (cached && cached.t && Date.now() - cached.t < CACHE_TTL && Array.isArray(cached.v)) {
+                    _db = cached.v;
+                    console.log('📚 Теги из кэша:', _db.length);
+                    return _db;
                 }
+            } catch (e) {}
+
+            // 2. Скачиваем CSV
+            console.log('📥 Загружаю 000.csv (14 МБ, только при первом заходе)...');
+            const t0 = Date.now();
+            const resp = await fetch(CSV_URL, { mode: 'cors' });
+            if (!resp.ok) throw new Error('CSV: HTTP ' + resp.status);
+            const text = await resp.text();
+            const tags = parseCsv(text);
+            const dt = ((Date.now() - t0) / 1000).toFixed(1);
+            console.log('📚 Теги загружены:', tags.length, 'шт. за', dt, 'сек');
+
+            _db = tags;
+            try {
+                await idbSet(CACHE_KEY, { t: Date.now(), v: tags });
+            } catch (e) {
+                console.warn('IndexedDB переполнен:', e);
             }
-        } catch (e) {}
+            return _db;
+        })();
 
-        const resp = await fetch(CSV_URL, { cache: 'force-cache' });
-        if (!resp.ok) throw new Error('CSV не загружен: ' + resp.status);
-        const text = await resp.text();
-        const rows = parseCSV(text);
-
-        const seen = new Map(); // name -> {name, count, freq}
-        // каждая строка: name, value, value_lower, date_created, date_last_used, count
-        for (let i = 1; i < rows.length; i++) {
-            const r = rows[i];
-            if (!r || !r[1]) continue;
-            const weight = parseInt(r[5] || '1', 10) || 1;
-            const tags = String(r[1]).split(',').map(s => s.trim()).filter(Boolean);
-            for (const tag of tags) {
-                const n = norm(tag);
-                if (n.length < 3 || n.length > 25) continue;
-                if (/^\d+$/.test(n)) continue;
-                if (!/[а-яa-z]/i.test(n)) continue;
-                if (!seen.has(n)) seen.set(n, { name: n, count: 0, freq: 0 });
-                const rec = seen.get(n);
-                rec.count += weight;
-                rec.freq += 1;
-            }
-        }
-
-        DB = [...seen.values()].sort((a, b) => b.count - a.count);
-        INDEX = buildIndex(DB);
-
-        try {
-            localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), tags: DB }));
-        } catch (e) {}
-
-        console.log('📚 Теги загружены:', DB.length);
-        return DB;
+        return _loading;
     }
 
-    // ─── Поиск с ранжированием ───
+    // ═══ Поиск ═══
+    function norm(s) {
+        return String(s || '').toLowerCase().replace(/ё/g, 'е').trim();
+    }
+
     function search(query, limit) {
+        if (!_db || !query) return [];
         limit = limit || 12;
-        if (!INDEX) return [];
         const q = norm(query);
-        if (q.length < 2) return [];
+        if (q.length < 1) return [];
 
-        const seen = new Map(); // name -> score
-
-        // 1) точное совпадение / префикс
-        const prefixBucket = INDEX.byPrefix.get(q.substring(0, Math.min(q.length, 6))) || [];
-        for (const t of prefixBucket) {
-            let score = 0;
-            if (t.name === q) score = 10000;
-            else if (t.name.startsWith(q)) score = 5000 + t.count;
-            else if (t.name.includes(q)) score = 1000 + t.count;
-            else {
-                // по словам
-                const qw = q.split(' ');
-                const tw = t.name.split(' ');
-                let ok = true;
-                for (const w of qw) {
-                    if (!tw.some(x => x.startsWith(w))) { ok = false; break; }
-                }
-                if (ok) score = 500 + t.count;
-            }
-            if (score > 0) seen.set(t.name, Math.max(seen.get(t.name) || 0, score));
+        const result = [];
+        for (let i = 0; i < _db.length && result.length < limit; i++) {
+            const tag = _db[i];
+            if (norm(tag).indexOf(q) === 0) result.push(tag);
         }
-
-        return [...seen.entries()]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, limit)
-            .map(([name]) => name);
+        return result;
     }
 
-    // ─── Получить статистику тега ───
-    function stats(name) {
-        if (!INDEX) return null;
-        return INDEX.byName.get(norm(name)) || null;
-    }
-
-    // ─── Публичное API ───
-    window.TagsDB = {
-        load,
-        search,
-        normalize: norm,
-        stats,
-        get list() { return DB || []; }
-    };
+    window.TagsDB = { load, search };
 })();
